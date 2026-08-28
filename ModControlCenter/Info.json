@@ -1,0 +1,52 @@
+{
+  "pkgId": "celso.modcontrolcenter",
+  "name": "泰拉 MOD 控制中心 (ImGui Full Damage Test)",
+  "author": "liuxin",
+  "version": "0.1.7",
+  "versionCode": 202608287,
+  "brieflyDescribe": "Dear ImGui 控制中心显示诊断版：强制 EGL damage 路径提交完整画面。",
+  "description": "独立 MOD 控制中心 v0.1.7。拦截 eglSwapBuffers 及 KHR/EXT damage 变体，在提交前绘制 ImGui，并对 damage 交换强制完整 Surface 更新；加入像素回读和交换路径诊断。不修改 Terraria 游戏数值。",
+  "features": [],
+  "sizeCategory": "SMALL",
+  "targetGameVersion": "1.4.5.6.4",
+  "minGameVersion": "1.4.5.6.4",
+  "maxGameVersion": "1.4.5.6.4",
+  "support": {
+    "android": {
+      "arm64": true,
+      "arm": false,
+      "x64": false,
+      "x86": false
+    },
+    "windows": {
+      "arm64": false,
+      "arm": false,
+      "x64": false,
+      "x86": false
+    },
+    "linux": {
+      "arm64": false,
+      "arm": false,
+      "x64": false,
+      "x86": false
+    },
+    "mac": {
+      "arm64": false,
+      "arm": false,
+      "x64": false,
+      "x86": false
+    },
+    "ios": {
+      "arm64": false,
+      "arm": false,
+      "x64": false,
+      "x86": false
+    }
+  },
+  "dependence": [],
+  "conflicts": [],
+  "stableVerified": false,
+  "experimental": true,
+  "deprecated": false,
+  "hasExtendedContent": true
+}
