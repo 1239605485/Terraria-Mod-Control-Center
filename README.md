@@ -1,4 +1,4 @@
-# 泰拉 MOD 控制中心 v0.1.7 — EGL Full Damage 诊断版
+# 泰拉 MOD 控制中心 v0.1.8 — Managed Draw 诊断版
 
 本版本继续只测试 ImGui 控制中心，不修改 Terraria 游戏数值。
 
@@ -7,14 +7,14 @@
 已确认：ShadowHook、eglSwapBuffers、GL Context、ImGui 初始化、RenderDrawData、framebuffer 0 均执行成功。
 同时 `FBO_NONZERO_SEEN` 未出现，因此 v0.1.5 的问题不是离屏 FBO。
 
-## v0.1.7 新增
+## v0.1.8 新增
 
-- `eglSwapBuffersWithDamageKHR/EXT` 提交时强制完整 Surface 更新
-- 使用 `glReadPixels` 验证诊断色块是否真正写入 back buffer
-- 分别统计普通 Swap、KHR、EXT 与强制全屏提交次数
-- 保留 v0.1.6 已验证的 EGL Surface、默认 framebuffer 与 viewport 修复
+- 不再从 `libEGL.so` 外部截获 Swap。
+- 改为在 `Terraria.Main.Draw` 后缀执行绘制，此时 Terraria 自身的场景和 UI 已完成组合，但 MonoGame 尚未提交画面。
+- 保留 `glReadPixels` 与 framebuffer 诊断，用于确认游戏绘制线程上的实际输出。
+- 新增 `MANAGED_DRAW_SEEN` 与 `MANAGED_DRAW_NO_CONTEXT` 日志探针。
 
-## v0.1.6 已有修复
+## 先前排查结论
 
 1. 检查 `eglGetCurrentSurface(EGL_DRAW)` 是否与 `eglSwapBuffers()` 传入 surface 相同。
 2. 若二者是不同的有效 surface，且同属当前 EGLDisplay，则临时 `eglMakeCurrent()` 到真正要 swap 的 surface，绘制完成后恢复。

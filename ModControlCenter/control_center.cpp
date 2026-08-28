@@ -26,6 +26,7 @@ using EglSwapBuffersFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
 using EglSwapBuffersWithDamageFn = EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint*, EGLint);
 
 patch_hook_id_t g_input_hook = PATCH_HOOK_INVALID_ID;
+patch_hook_id_t g_draw_hook = PATCH_HOOK_INVALID_ID;
 patch_handle_t g_field_screen_width = PATCH_NULL;
 patch_handle_t g_field_screen_height = PATCH_NULL;
 patch_handle_t g_field_mouse_x = PATCH_NULL;
@@ -51,6 +52,7 @@ std::atomic<unsigned long long> g_plain_swap_count{0};
 std::atomic<unsigned long long> g_khr_damage_swap_count{0};
 std::atomic<unsigned long long> g_ext_damage_swap_count{0};
 std::atomic<unsigned long long> g_forced_full_damage_count{0};
+std::atomic<unsigned long long> g_managed_draw_count{0};
 std::atomic<unsigned int> g_probe_pixel_rgba{0};
 std::atomic<unsigned int> g_native_probe_flags{0};
 std::atomic<unsigned int> g_native_probe_emitted{0};
@@ -90,7 +92,9 @@ enum NativeProbeFlag : unsigned int {
     PROBE_DAMAGE_EXT_SEEN = 1u << 22,
     PROBE_FULL_DAMAGE_FORCED = 1u << 23,
     PROBE_PIXEL_READBACK_OK = 1u << 24,
-    PROBE_PIXEL_READBACK_FAIL = 1u << 25
+    PROBE_PIXEL_READBACK_FAIL = 1u << 25,
+    PROBE_MANAGED_DRAW_SEEN = 1u << 26,
+    PROBE_MANAGED_DRAW_NO_CONTEXT = 1u << 27
 };
 
 bool g_imgui_ready = false;
@@ -104,6 +108,8 @@ std::string g_config_path;
 std::string g_runtime_log_path;
 std::mutex g_log_mutex;
 std::chrono::steady_clock::time_point g_last_frame_time;
+
+void render_before_native_swap(EGLDisplay dpy, EGLSurface surface, const char* source_name);
 
 std::string join_path(const std::string& dir, const char* name) {
     if (dir.empty()) return std::string(name ? name : "");
@@ -203,6 +209,8 @@ void flush_native_probe_markers_on_game_thread() {
         {PROBE_FULL_DAMAGE_FORCED, "FULL_DAMAGE_FORCED"},
         {PROBE_PIXEL_READBACK_OK, "PIXEL_READBACK_OK"},
         {PROBE_PIXEL_READBACK_FAIL, "PIXEL_READBACK_FAIL"},
+        {PROBE_MANAGED_DRAW_SEEN, "MANAGED_DRAW_SEEN"},
+        {PROBE_MANAGED_DRAW_NO_CONTEXT, "MANAGED_DRAW_NO_CONTEXT"},
     };
 
     for (const auto& m : markers) {
@@ -280,6 +288,33 @@ void main_update_postfix(
             g_diag_dimensions_emitted.store(true, std::memory_order_release);
         }
     }
+}
+
+// Terraria.Main.Draw executes on the game's actual graphics timeline. A postfix
+// here runs after Terraria's own scene/UI composition and before MonoGame's
+// present step; it avoids choosing an EGL surface from outside that timeline.
+void main_draw_postfix(
+    patch_handle_t instance,
+    void** args,
+    void* result,
+    const patch_method_signature_t* sig_info
+) {
+    (void)instance;
+    (void)args;
+    (void)result;
+    (void)sig_info;
+
+    g_managed_draw_count.fetch_add(1, std::memory_order_relaxed);
+    g_native_probe_flags.fetch_or(PROBE_MANAGED_DRAW_SEEN, std::memory_order_release);
+
+    const EGLDisplay dpy = eglGetCurrentDisplay();
+    const EGLSurface surface = eglGetCurrentSurface(EGL_DRAW);
+    if (dpy == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE || eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        g_native_probe_flags.fetch_or(PROBE_MANAGED_DRAW_NO_CONTEXT, std::memory_order_release);
+        return;
+    }
+
+    render_before_native_swap(dpy, surface, "Terraria.Main.Draw postfix");
 }
 
 bool init_imgui_on_egl_thread(EGLDisplay dpy, EGLSurface surface, int surface_w, int surface_h) {
@@ -713,15 +748,14 @@ extern "C" void mod_control_center_init(kernel_mod_handle_t* handle) {
     if (!g_runtime_log_path.empty()) {
         FILE* f = std::fopen(g_runtime_log_path.c_str(), "w");
         if (f) {
-            std::fprintf(f, "MOD Control Center v0.1.7 - full-damage presentation diagnostic\n");
+            std::fprintf(f, "MOD Control Center v0.1.8 - Terraria.Main.Draw render timeline diagnostic\n");
             std::fclose(f);
         }
     }
 
     load_config();
 
-    // Managed hook only samples Terraria's touch/mouse state. Rendering happens
-    // exclusively in the native EGL swap hook, so patchlib is never called from the EGL thread.
+    // Both input and final overlay drawing are attached to Terraria's own update/draw timeline.
     patch_handle_t main_type = patchlib_type_get_type("Terraria", "Main");
     if (main_type) {
         g_field_screen_width = patchlib_type_get_field(main_type, "screenWidth");
@@ -740,79 +774,32 @@ extern "C" void mod_control_center_init(kernel_mod_handle_t* handle) {
             append_runtime_log("input: Main.Update not found; UI can render but touch may not work");
         }
 
+        patch_handle_t draw = patchlib_type_get_method_by_param_count(main_type, "Draw", 1);
+        if (!draw) draw = patchlib_type_get_method(main_type, "Draw");
+        if (draw) {
+            g_draw_hook = patchlib_install_prepost_hook(draw, nullptr, main_draw_postfix);
+            append_runtime_logf("render: Main.Draw postfix hook id=%d", (int)g_draw_hook);
+            patchlib_free(draw);
+        } else {
+            append_runtime_log("render: Main.Draw not found; overlay cannot be scheduled on game render timeline");
+        }
+
         patchlib_free(main_type);
     } else {
         append_runtime_log("input: Terraria.Main type not found");
     }
 
-    const int sh_init = shadowhook_init(SHADOWHOOK_MODE_SHARED, true);
-    if (sh_init != 0) {
-        g_native_probe_flags.fetch_or(PROBE_SHADOWHOOK_INIT_FAIL, std::memory_order_release);
-        emit_tef_probe_marker("SHADOWHOOK_INIT_FAIL_IMMEDIATE");
-        append_runtime_logf("shadowhook: init failed err=%d msg=%s", sh_init, shadowhook_to_errmsg(sh_init));
-        return;
-    }
-    g_native_probe_flags.fetch_or(PROBE_SHADOWHOOK_INIT_OK, std::memory_order_release);
-    emit_tef_probe_marker("SHADOWHOOK_INIT_OK_IMMEDIATE");
-    append_runtime_log("shadowhook: initialized in SHARED mode (v1.0.10 static path)");
-
-    g_swap_hook_stub = shadowhook_hook_sym_name_callback(
-        "libEGL.so",
-        "eglSwapBuffers",
-        reinterpret_cast<void*>(hooked_egl_swap_buffers),
-        reinterpret_cast<void**>(&g_original_egl_swap_buffers),
-        shadowhook_hooked_callback,
-        nullptr
-    );
-
-    if (!g_swap_hook_stub) {
-        g_native_probe_flags.fetch_or(PROBE_EGL_HOOK_REQUEST_FAIL, std::memory_order_release);
-        emit_tef_probe_marker("EGL_HOOK_REQUEST_FAIL_IMMEDIATE");
-        const int err = shadowhook_get_errno();
-        append_runtime_logf("shadowhook: eglSwapBuffers hook failed err=%d msg=%s", err, shadowhook_to_errmsg(err));
-    } else {
-        g_native_probe_flags.fetch_or(PROBE_EGL_HOOK_REQUEST_OK, std::memory_order_release);
-        emit_tef_probe_marker("EGL_HOOK_REQUEST_OK_IMMEDIATE");
-        append_runtime_logf("shadowhook: eglSwapBuffers hook stub=%p orig=%p", g_swap_hook_stub, reinterpret_cast<void*>(g_original_egl_swap_buffers));
-    }
-
-    // Some Android render paths use the damage variants directly. Hook them too.
-    // A thread-local recursion guard prevents double rendering if one variant calls another internally.
-    g_swap_damage_khr_hook_stub = shadowhook_hook_sym_name_callback(
-        "libEGL.so",
-        "eglSwapBuffersWithDamageKHR",
-        reinterpret_cast<void*>(hooked_egl_swap_buffers_with_damage_khr),
-        reinterpret_cast<void**>(&g_original_egl_swap_buffers_with_damage_khr),
-        shadowhook_hooked_callback,
-        nullptr
-    );
-    if (!g_swap_damage_khr_hook_stub) {
-        const int err = shadowhook_get_errno();
-        append_runtime_logf("shadowhook: eglSwapBuffersWithDamageKHR hook unavailable err=%d msg=%s", err, shadowhook_to_errmsg(err));
-    } else {
-        append_runtime_logf("shadowhook: eglSwapBuffersWithDamageKHR stub=%p", g_swap_damage_khr_hook_stub);
-    }
-
-    g_swap_damage_ext_hook_stub = shadowhook_hook_sym_name_callback(
-        "libEGL.so",
-        "eglSwapBuffersWithDamageEXT",
-        reinterpret_cast<void*>(hooked_egl_swap_buffers_with_damage_ext),
-        reinterpret_cast<void**>(&g_original_egl_swap_buffers_with_damage_ext),
-        shadowhook_hooked_callback,
-        nullptr
-    );
-    if (!g_swap_damage_ext_hook_stub) {
-        const int err = shadowhook_get_errno();
-        append_runtime_logf("shadowhook: eglSwapBuffersWithDamageEXT hook unavailable err=%d msg=%s", err, shadowhook_to_errmsg(err));
-    } else {
-        append_runtime_logf("shadowhook: eglSwapBuffersWithDamageEXT stub=%p", g_swap_damage_ext_hook_stub);
-    }
+    append_runtime_log("render: v0.1.8 uses Terraria.Main.Draw postfix; native eglSwapBuffers interception disabled");
 }
 
 extern "C" void mod_control_center_cleanup(void) {
     if (g_input_hook != PATCH_HOOK_INVALID_ID) {
         patchlib_uninstall_hook(g_input_hook);
         g_input_hook = PATCH_HOOK_INVALID_ID;
+    }
+    if (g_draw_hook != PATCH_HOOK_INVALID_ID) {
+        patchlib_uninstall_hook(g_draw_hook);
+        g_draw_hook = PATCH_HOOK_INVALID_ID;
     }
 
     if (g_swap_damage_ext_hook_stub) {
@@ -844,7 +831,8 @@ extern "C" void mod_control_center_cleanup(void) {
     free_handle(g_field_mouse_left);
 
     append_runtime_logf(
-        "cleanup: swaps=%llu renders=%llu plain=%llu khr=%llu ext=%llu forced_full=%llu pixel=0x%08X",
+        "cleanup: managed_draws=%llu swaps=%llu renders=%llu plain=%llu khr=%llu ext=%llu forced_full=%llu pixel=0x%08X",
+        g_managed_draw_count.load(std::memory_order_relaxed),
         g_swap_count.load(std::memory_order_relaxed),
         g_render_count.load(std::memory_order_relaxed),
         g_plain_swap_count.load(std::memory_order_relaxed),
